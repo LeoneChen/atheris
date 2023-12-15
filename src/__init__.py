@@ -22,12 +22,21 @@ from .instrument_bytecode import instrument_all
 from .instrument_bytecode import instrument_func
 from .instrument_bytecode import patch_code
 from .utils import path
+
+from .native import FuzzLv1   
+from .native import FuzzLv2   
+from .native import SetupCore   
+from .native import SetLv2Driver
+from .native import GetCovUpdateDuration 
+
+
 # MyPy cannot find native code.
 from .native import _reserve_counter  # type: ignore[import]
 from .native import _trace_branch  # type: ignore[import]
 from .native import _trace_cmp  # type: ignore[import]
 from .native import _trace_regex_match  # type: ignore[import]
 from .native import ALL_REMAINING  # type: ignore[import]
+
 from .native import Fuzz  # type: ignore[import]
 from .native import FuzzedDataProvider  # type: ignore[import]
 from .native import Mutate  # type: ignore[import]

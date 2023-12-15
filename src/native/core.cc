@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
 
 #include <atomic>
 #include <cerrno>
@@ -36,12 +37,20 @@
 #include "timeout.h"
 #include "tracer.h"
 #include "util.h"
+#include "custom_mutator.h"
 
 using UserCb = int (*)(const uint8_t* Data, size_t Size);
 
 extern "C" {
 int LLVMFuzzerRunDriver(int* argc, char*** argv,
                         int (*UserCb)(const uint8_t* Data, size_t Size));
+
+int LLVMFuzzerRunDriverPyCore(int* argc, char*** argv,
+                              int (*UserCb)(const char *Script),
+                              const char* (*CbRandom) (const char *Dir),
+                              const char* (*CbSpecified) (const char *Seed),
+                              std::size_t (*CbUserMutator)(uint8_t* data, std::size_t size, std::size_t max_size, unsigned int seed));
+int  LLVMFuzzerGetCovUpdateDuration();
 size_t LLVMFuzzerMutate(uint8_t* Data, size_t Size, size_t MaxSize);
 void __sanitizer_cov_8bit_counters_init(uint8_t* start, uint8_t* stop);
 void __sanitizer_cov_pcs_init(uint8_t* pcs_beg, uint8_t* pcs_end);
@@ -50,9 +59,15 @@ void __sanitizer_cov_pcs_init(uint8_t* pcs_beg, uint8_t* pcs_end);
 NO_SANITIZE
 std::string GetLibFuzzerSymbolsLocation() {
   Dl_info dl_info;
+  
   if (!dladdr((void*)&LLVMFuzzerRunDriver, &dl_info)) {
-    return "<Not a shared object>";
+    return "<LLVMFuzzerRunDriver -> Not a shared object>";
   }
+
+  if (!dladdr((void*)&LLVMFuzzerRunDriverPyCore, &dl_info)) {
+    return "<LLVMFuzzerRunDriverPyCore -> Not a shared object>";
+  }
+  
   return (dl_info.dli_fname);
 }
 
@@ -74,6 +89,27 @@ std::function<void(py::bytes data)>& test_one_input_global =
       std::cerr << "You must call Setup() before Fuzz()." << std::endl;
       throw std::runtime_error("You must call Setup() before Fuzz().");
     });
+
+std::function<void(std::string script)>& test_one_script_global =
+    *new std::function<void(std::string script)>([](std::string script) -> void {
+      std::cerr << "You must call SetupCore() before FuzzLv1()." << std::endl;
+      throw std::runtime_error("You must call SetupCore() before FuzzLv1().");
+    });
+
+std::function<std::string(std::string script)>& get_random_script_global =
+    *new std::function<std::string(std::string script)>([](std::string dir) -> std::string {
+      std::cerr << "get_random_seed not initialized, you must call SetupCore() before FuzzLv1()." << std::endl;
+      throw std::runtime_error("You must call SetupCore() before FuzzLv1().");
+    });
+
+std::function<std::string(std::string script)>& get_specified_script_global =
+    *new std::function<std::string(std::string script)>([](std::string seed) -> std::string {
+      std::cerr << "get_specified_seed not initialized, you must call SetupCore() before FuzzLv1()." << std::endl;
+      throw std::runtime_error("You must call SetupCore() before FuzzLv1().");
+    });
+    
+static bool py_core_fuzzing = false;
+
 int64_t runs = -1;  // Default from libFuzzer, means infinite
 int64_t completed_runs = 0;
 int64_t fuzzer_start_time;
@@ -83,6 +119,13 @@ void Init() {
   if (!&LLVMFuzzerRunDriver) {
     throw std::runtime_error(
         "LLVMFuzzerRunDriver symbol not found. This means "
+        "you had an old version of Clang installed when "
+        "you built Atheris.");
+  }
+
+  if (!&LLVMFuzzerRunDriverPyCore) {
+    throw std::runtime_error(
+        "LLVMFuzzerRunDriverPyCore symbol not found. This means "
         "you had an old version of Clang installed when "
         "you built Atheris.");
   }
@@ -128,6 +171,10 @@ bool OnFirstTestOneInput() {
   return true;
 }
 
+static int fd_stdout_backup = dup(1);
+static int fd_stderr_backup = dup(2);
+static int null_fd = open ("/dev/null", O_RDWR);
+
 NO_SANITIZE
 int TestOneInput(const uint8_t* data, size_t size) {
   static bool dummy = OnFirstTestOneInput();
@@ -143,8 +190,14 @@ int TestOneInput(const uint8_t* data, size_t size) {
   }
 
   try {
+    dup2 (null_fd, 1), dup2 (null_fd, 2);
+
     test_one_input_global(py::bytes(reinterpret_cast<const char*>(data), size));
+
+    dup2 (fd_stdout_backup, 1), dup2 (fd_stderr_backup, 2);
   } catch (py::error_already_set& ex) {
+    dup2 (fd_stdout_backup, 1), dup2 (fd_stderr_backup, 2);
+
     std::string exception_type = GetExceptionType(ex);
     if (exception_type == "KeyboardInterrupt" ||
         exception_type == "exceptions.KeyboardInterrupt") {
@@ -155,7 +208,7 @@ int TestOneInput(const uint8_t* data, size_t size) {
       GracefulExit(130);
     }
     std::cout << Colorize(STDOUT_FILENO,
-                          "\n === Uncaught Python exception: ===\n");
+                          "\n === Uncaught Python exception at Level-2: ===\n");
     PrintPythonException(ex, std::cout);
     GracefulExit(-1, /*prevent_crash_report=*/false);
   }
@@ -179,8 +232,128 @@ int TestOneInput(const uint8_t* data, size_t size) {
 
 NO_SANITIZE
 void start_fuzzing(const std::vector<std::string>& args,
-                   const std::function<void(py::bytes data)>& test_one_input) {
+                          const std::function<void(py::bytes data)>& test_one_input) {
   test_one_input_global = test_one_input;
+
+  bool registered_alarm = true;
+  if (py_core_fuzzing == false)
+    registered_alarm = SetupPythonSigaction();
+
+  std::vector<char*> arg_array;
+  arg_array.reserve(args.size() + 1);
+  for (const std::string& arg : args) {
+    // We care about certain arguments. Other arguments are passed through to
+    // libFuzzer.
+    if (arg.substr(0, 9) == "-timeout=") {
+      if (!registered_alarm) {
+        std::cerr << "WARNING: -timeout ignored." << std::endl;
+      }
+      SetTimeout(std::stoi(arg.substr(9, std::string::npos)));
+    }
+    if (arg.substr(0, 14) == "-atheris_runs=") {
+      // We want to handle 'runs' ourselves so we can exit gracefully rather
+      // than letting libFuzzer call _exit().
+      // This is a different flag from -runs because -runs sometimes has other
+      // unrelated behavior. For example, if you set -runs when running with
+      // a fixed set of inputs, *each* input will be run that many times. The
+      // -atheris_runs= flag always performs precisely the specified number of
+      // runs.
+      runs = std::stoll(arg.substr(14, std::string::npos));
+      continue;
+    }
+    if (arg.substr(0, 14) == "-max_counters=") {
+      int max = std::stoll(arg.substr(14, std::string::npos));
+      SetMaxCounters(max);
+      continue;
+    }
+
+    arg_array.push_back(const_cast<char*>(arg.c_str()));
+  }
+
+  arg_array.push_back(nullptr);
+  char** args_ptr = &arg_array[0];
+  int args_size = arg_array.size() - 1;
+
+  fuzzer_start_time = std::chrono::duration_cast<std::chrono::seconds>(
+                          std::chrono::system_clock::now().time_since_epoch())
+                          .count();
+  if (py_core_fuzzing)
+    LLVMFuzzerRunDriver(&args_size, &args_ptr, &TestOneInput);
+  else
+    GracefulExit(LLVMFuzzerRunDriver(&args_size, &args_ptr, &TestOneInput));
+}
+
+
+NO_SANITIZE
+int TestOneScript(const char* Script) {
+
+  const auto alloc = AllocateCountersAndPcs();
+  
+  if (alloc.counters_start && alloc.counters_end) {
+    __sanitizer_cov_8bit_counters_init(alloc.counters_start,
+                                       alloc.counters_end);
+  }
+  
+  if (alloc.pctable_start && alloc.pctable_end) {
+    __sanitizer_cov_pcs_init(alloc.pctable_start, alloc.pctable_end);
+  }
+
+  try {
+    test_one_script_global(Script);
+  } catch (py::error_already_set& ex) {
+    std::string exception_type = GetExceptionType(ex);
+    if (exception_type == "KeyboardInterrupt" ||
+        exception_type == "exceptions.KeyboardInterrupt") {
+      // Unfortunately, this can occur in the transition between Python and C++,
+      // in which case it's impossible to catch in Python. Exit here instead.
+      std::cout << Colorize(STDOUT_FILENO, "KeyboardInterrupt: stopping.")
+                << std::endl;
+      GracefulExit(130);
+    }
+    std::cout << Colorize(STDOUT_FILENO,
+                          "\n === Uncaught Python exception at Level-1: ===\n");
+    PrintPythonException(ex, std::cout);
+    exit (0);
+  }
+
+  --runs;
+  ++completed_runs;
+  if (!runs) {
+    // We've completed all requested runs.
+    uint64_t elapsed_time =
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count() -
+        fuzzer_start_time;
+    std::cerr << "Done " << completed_runs << " in " << elapsed_time
+              << " second(s)" << std::endl;
+    GracefulExit(0);
+  }
+
+  return 0;
+}
+
+NO_SANITIZE
+const char* GetRandomSeed(const char* Dir) {
+  std::string NewSeed = get_random_script_global (Dir);
+  return strdup(NewSeed.c_str());
+}
+
+NO_SANITIZE
+const char* GetSpecifiedSeed(const char* Seed) {
+  std::string NewSeed = get_specified_script_global (Seed);
+  return strdup (NewSeed.c_str());
+}
+
+NO_SANITIZE
+void start_fuzzing_core(const std::vector<std::string>& args,
+                        const std::function<void(std::string script)>& test_one_script,
+                        std::function<std::string(std::string script)>& get_random_script,
+                        std::function<std::string(std::string script)>& get_specified_script) {
+  test_one_script_global      = test_one_script;
+  get_random_script_global    = get_random_script;
+  get_specified_script_global = get_specified_script;
+  py_core_fuzzing = true;
 
   bool registered_alarm = SetupPythonSigaction();
 
@@ -223,8 +396,14 @@ void start_fuzzing(const std::vector<std::string>& args,
                           std::chrono::system_clock::now().time_since_epoch())
                           .count();
 
-  GracefulExit(LLVMFuzzerRunDriver(&args_size, &args_ptr, &TestOneInput));
+  int Ret = LLVMFuzzerRunDriverPyCore(&args_size, &args_ptr, 
+                                      &TestOneScript,
+                                      &GetRandomSeed,
+                                      &GetSpecifiedSeed,
+                                      &LLVMFuzzerCustomMutator);
+  GracefulExit(Ret);
 }
+
 
 NO_SANITIZE
 py::bytes Mutate(py::bytes data, size_t max_size) {
@@ -237,6 +416,12 @@ py::bytes Mutate(py::bytes data, size_t max_size) {
   return py::bytes(d.data(), new_size);
 }
 
+NO_SANITIZE
+int GetCovUpdateDuration ()
+{
+  return LLVMFuzzerGetCovUpdateDuration();
+}
+
 #ifndef ATHERIS_MODULE_NAME
 #define ATHERIS_MODULE_NAME core_with_libfuzzer
 #endif  // ATHERIS_MODULE_NAME
@@ -245,6 +430,9 @@ PYBIND11_MODULE(ATHERIS_MODULE_NAME, m) {
   Init();
 
   m.def("start_fuzzing", &start_fuzzing);
+  m.def("start_fuzzing_core", &start_fuzzing_core);
+  m.def("GetCovUpdateDuration", &GetCovUpdateDuration);
+  
   m.def("_trace_branch", &_trace_branch);
   m.def("_reserve_counter", ReserveCounter);
   m.def("_reserve_counters", ReserveCounters);

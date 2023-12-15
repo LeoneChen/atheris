@@ -52,6 +52,16 @@ void LibfuzzerAlarmSignalCallback(int signum) {
     _exit(1);
   }
   libfuzzer_alarm_signal(signum);
+  exit (0);
+}
+
+NO_SANITIZE
+void* ForceExit (void *arg)
+{
+  sleep (5);
+  std::cout << Colorize(STDOUT_FILENO, "\n === Force to Exit ===")
+            << std::endl;
+  LibfuzzerAlarmSignalCallback (0);
 }
 
 // Our SIGALRM signal handler.
@@ -78,10 +88,13 @@ void HandleAlarm(int signum) {
     struct sigaction action;
     checked_sigaction(SIGALRM, nullptr, &action);
 
-    action.sa_handler = LibfuzzerAlarmSignalCallback;
-    checked_sigaction(SIGALRM, &action, nullptr);
+    //action.sa_handler = LibfuzzerAlarmSignalCallback;
+    //checked_sigaction(SIGALRM, &action, nullptr);
 
-    alarm(1);  // Set 1 second until alarm.
+    //alarm(1);  // Set 1 second until alarm.
+
+    pthread_t tid;
+    pthread_create(&tid, NULL, ForceExit, NULL);
   }
 }
 

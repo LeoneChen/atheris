@@ -104,6 +104,7 @@ def get_libfuzzer_lib():
   try:
     libfuzzer = subprocess.check_output(
         [current_path + "/setup_utils/find_libfuzzer.sh"])
+    print("@@@ Wen -> libfuzzer = " + str(libfuzzer) + " @@@")
   except subprocess.CalledProcessError as e:
     sys.stderr.write(no_libfuzzer_error + "\n")
     raise RuntimeError(no_libfuzzer_error)

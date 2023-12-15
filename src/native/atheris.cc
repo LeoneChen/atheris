@@ -44,6 +44,26 @@ std::function<void(py::bytes data)>& test_one_input_global =
       std::cerr << "You must call Setup() before Fuzz()." << std::endl;
       _exit(-1);
     });
+
+std::function<void(std::string script)>& test_one_script_global =
+    *new std::function<void(std::string script)>([](std::string script) -> void {
+      std::cerr << "You must call SetupCore() before Fuzz()." << std::endl;
+      _exit(-1);
+    });
+
+std::function<std::string(std::string script)>& get_random_script_global =
+    *new std::function<std::string(std::string dir)>([](std::string script) -> std::string {
+      std::cerr << "You must call SetupCore() before Fuzz()." << std::endl;
+      _exit(-1);
+    });
+
+std::function<std::string(std::string script)>& get_specified_script_global =
+    *new std::function<std::string(std::string seed)>([](std::string script) -> std::string {
+      std::cerr << "You must call SetupCore() before Fuzz()." << std::endl;
+      _exit(-1);
+    });
+    
+
 std::function<py::bytes(py::bytes data, size_t max_size, unsigned int seed)>
     custom_mutator_global;
 bool use_custom_mutator = false;
@@ -145,6 +165,54 @@ std::vector<std::string> Setup(
   return ret;
 }
 
+
+std::vector<std::string> SetupCore(
+    const std::vector<std::string>& args,
+    const std::function<void(std::string script_name)>& test_one_script,
+    const std::function<std::string(std::string dir)>& get_random_script,
+    const std::function<std::string(std::string seed)>& get_specified_script,
+    py::kwargs kwargs)
+{
+    std::vector<std::string> ret = Setup (args, NULL, kwargs);
+
+    test_one_script_global      = test_one_script;
+    get_random_script_global    = get_random_script;
+    get_specified_script_global = get_specified_script;
+
+    return ret;
+}
+
+
+NO_SANITIZE
+void SetLv2Driver(const std::function<void(py::bytes data)>& test_one_input, std::string test_input)
+{
+    test_one_input_global = test_one_input;
+
+    const char *c_test_input = test_input.c_str();
+    if (access (c_test_input, F_OK) < 0)
+    {
+        mkdir (c_test_input, 0755);
+    }
+
+    args_global.pop_back ();
+    args_global.push_back (test_input);
+    //for (auto It = args_global.begin (); It != args_global.end (); It++)
+    //{
+    //    printf ("args_global ---> %s \r\n", It->c_str());
+    //}
+    return;
+}
+
+NO_SANITIZE
+int GetCovUpdateDuration ()
+{
+  std::cerr << Colorize(STDERR_FILENO,
+                        "Fuzz() must be called before GetCovUpdateDuration() can be called.")
+            << std::endl;
+  exit(-1);
+}
+
+
 // Checks if libfuzzer is already present.
 NO_SANITIZE
 bool libfuzzer_is_loaded() {
@@ -152,9 +220,10 @@ bool libfuzzer_is_loaded() {
   if (!self_lib) return false;
 
   void* sym = dlsym(self_lib, "LLVMFuzzerRunDriver");
+  void* symPy = dlsym(self_lib, "LLVMFuzzerRunDriverPyCore");
 
   dlclose(self_lib);
-  return sym;
+  return (sym && symPy);
 }
 
 NO_SANITIZE
@@ -244,13 +313,84 @@ void Fuzz() {
   atheris.attr("_trace_regex_match") = core.attr("_trace_regex_match");
   atheris.attr("_trace_branch") = core.attr("_trace_branch");
   atheris.attr("_reserve_counter") = core.attr("_reserve_counter");
+  atheris.attr("GetCovUpdateDuration") = core.attr("GetCovUpdateDuration");
 
   core.attr("start_fuzzing")(args_global, test_one_input_global);
 }
 
+
+NO_SANITIZE
+void FuzzLv1() {
+  if (!setup_called) {
+    std::cerr << Colorize(STDERR_FILENO,
+                          "Setup() must be called before Fuzz() can be called.")
+              << std::endl;
+    exit(1);
+  }
+
+  py::module atheris =
+      (py::module)py::module::import("sys").attr("modules")["atheris"];
+
+  std::string atheris_prefix = "atheris.";
+
+  if (use_custom_mutator) {
+    py::module custom_mutator =
+        LoadExternalFunctionsModule(atheris_prefix + "custom_mutator");
+    custom_mutator.attr("_set_custom_mutator")(custom_mutator_global);
+  }
+  if (use_custom_crossover) {
+    py::module custom_crossover =
+        LoadExternalFunctionsModule(atheris_prefix + "custom_crossover");
+    custom_crossover.attr("_set_custom_crossover")(custom_crossover_global);
+  }
+  py::module core = LoadCoreModule();
+
+  // Reserve all pending counters
+  int res_ctrs = core.attr("_reserve_counters")(pending_counters).cast<int>();
+  if (res_ctrs != 0) {
+    std::cerr << Colorize(
+                     STDERR_FILENO,
+                     "FuzzLv1: Atheris internal error: expected 0 counters previously "
+                     "reserved when reserving preregistered batch; got " +
+                         std::to_string(res_ctrs))
+              << std::endl;
+    _exit(1);
+  }
+  pending_counters = 0;
+
+  atheris.attr("Mutate") = core.attr("Mutate");
+  atheris.attr("_trace_cmp") = core.attr("_trace_cmp");
+  atheris.attr("_trace_regex_match") = core.attr("_trace_regex_match");
+  atheris.attr("_trace_branch") = core.attr("_trace_branch");
+  atheris.attr("_reserve_counter") = core.attr("_reserve_counter");
+  atheris.attr("GetCovUpdateDuration") = core.attr("GetCovUpdateDuration");
+
+  core.attr("start_fuzzing_core")(args_global, test_one_script_global,
+                                  get_random_script_global,
+                                  get_specified_script_global);
+}
+
+
+NO_SANITIZE
+void FuzzLv2() {
+    py::module core = LoadCoreModule();
+    core.attr("start_fuzzing")(args_global, test_one_input_global);
+
+    return;
+}
+
+
 PYBIND11_MODULE(native, m) {
-  m.def("Setup", &Setup);
+
+  m.def("Setup", &Setup);  
   m.def("Fuzz", &Fuzz);
+
+  m.def("SetupCore", &SetupCore);
+  m.def("FuzzLv1", &FuzzLv1);
+  m.def("FuzzLv2", &FuzzLv2);
+  m.def("SetLv2Driver", &SetLv2Driver);
+  m.def("GetCovUpdateDuration", &GetCovUpdateDuration);
+  
   m.def("Mutate", &Mutate);
   m.def("_trace_branch", &prefuzz_trace_branch);
   m.def("_trace_cmp", &prefuzz_trace_cmp, py::return_value_policy::move);
